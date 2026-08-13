@@ -1,0 +1,352 @@
+name: Workflow B
+
+on:
+  repository_dispatch:
+    types:
+      - wake-up-b
+
+concurrency:
+  group: persistent-runner
+  cancel-in-progress: false
+
+jobs:
+  execute:
+    runs-on: ubuntu-24.04-arm
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore persistent data
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+
+          mkdir -p \
+            "$HOME/.local" \
+            "$HOME/.cache" \
+            "$HOME/.cargo" \
+            "$HOME/.dotnet" \
+            persistent_storage
+
+          gh release download persistent-data \
+            --pattern "backup.tar.gz" \
+            --clobber \
+            >/dev/null 2>&1 || true
+
+          if [[ -f backup.tar.gz ]]; then
+            tar -xzf backup.tar.gz -C / \
+              >/dev/null 2>&1 || true
+            rm -f backup.tar.gz
+          fi
+
+          if [[ -d "$HOME/.venv/bin" ]]; then
+            echo "$HOME/.venv/bin" >> "$GITHUB_PATH"
+          fi
+
+          echo "$HOME/.dotnet" >> "$GITHUB_PATH"
+
+          if [[ -f "$HOME/.cargo/env" ]]; then
+            source "$HOME/.cargo/env" || true
+          fi
+
+      - name: Setup root password
+        run: |
+          echo "root:admin" | sudo chpasswd
+
+      - name: Execute persistent runner
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+
+          CURRENT_PID=""
+          LAST_CONTENT=""
+          START_TIME=$(date +%s)
+          MAX_RUNTIME=14400
+          LAST_BACKUP_TIME=$START_TIME
+
+          export PERSISTENT_STORAGE="$PWD/persistent_storage"
+
+          mkdir -p "$PERSISTENT_STORAGE"
+
+          GIT_LOCK="$PWD/.git-operation.lock"
+
+          acquire_git_lock() {
+            while ! mkdir "$GIT_LOCK" 2>/dev/null; do
+              sleep 0.2
+            done
+          }
+
+          release_git_lock() {
+            rmdir "$GIT_LOCK" 2>/dev/null || true
+          }
+
+          fetch_remote_run() {
+            acquire_git_lock
+
+            git fetch origin main \
+              >/dev/null 2>&1 || true
+
+            if git cat-file -e "origin/main:run.r" 2>/dev/null; then
+              git show "origin/main:run.r" \
+                > .run.remote 2>/dev/null || true
+            fi
+
+            release_git_lock
+          }
+
+          commit_output() {
+            acquire_git_lock
+
+            git config user.name "github-actions" \
+              >/dev/null 2>&1 || true
+
+            git config user.email "actions@github.com" \
+              >/dev/null 2>&1 || true
+
+            git add output.r >/dev/null 2>&1 || true
+
+            if ! git diff --cached --quiet 2>/dev/null; then
+
+              git commit -m "Update output" \
+                >/dev/null 2>&1 || true
+
+              for attempt in 1 2 3 4 5; do
+
+                git fetch origin main \
+                  >/dev/null 2>&1 || true
+
+                if git merge-base --is-ancestor \
+                  HEAD origin/main 2>/dev/null; then
+
+                  if git push origin HEAD:main \
+                    >/dev/null 2>&1; then
+                    break
+                  fi
+
+                else
+
+                  git rebase origin/main \
+                    >/dev/null 2>&1 || {
+                      git rebase --abort \
+                        >/dev/null 2>&1 || true
+                    }
+
+                  if git push origin HEAD:main \
+                    >/dev/null 2>&1; then
+                    break
+                  fi
+
+                fi
+
+                sleep 2
+              done
+            fi
+
+            release_git_lock
+          }
+
+          backup_to_release() {
+            rm -f backup.tar.gz
+
+            tar -czf backup.tar.gz \
+              "$HOME/.local" \
+              "$HOME/.cache" \
+              "$HOME/.cargo" \
+              "$HOME/.dotnet" \
+              persistent_storage \
+              >/dev/null 2>&1 || true
+
+            if [[ -f backup.tar.gz ]]; then
+
+              SIZE=$(stat -c%s backup.tar.gz 2>/dev/null || echo 0)
+
+              if [[ "$SIZE" -gt 100 ]]; then
+
+                gh release delete persistent-data \
+                  --yes \
+                  >/dev/null 2>&1 || true
+
+                gh release create persistent-data \
+                  --title "Persistent Data" \
+                  --notes "Backup at $(date)" \
+                  >/dev/null 2>&1 || true
+
+                gh release upload persistent-data \
+                  backup.tar.gz \
+                  --clobber \
+                  >/dev/null 2>&1 || true
+              fi
+            fi
+
+            rm -f backup.tar.gz
+          }
+
+          run_script() {
+            local SCRIPT="$1"
+
+            if [[ ! -f "$SCRIPT" ]]; then
+              echo "run.r not found" >> output.r
+              commit_output
+              return
+            fi
+
+            echo "admin" | sudo -S bash "$SCRIPT" 2>&1 |
+            while IFS= read -r line; do
+              echo "$line" >> output.r
+              commit_output
+            done
+          }
+
+          fetch_remote_run
+
+          if [[ -f ".run.remote" ]]; then
+            cp .run.remote .run.current
+          elif [[ -f "run.r" ]]; then
+            cp run.r .run.current
+          else
+            echo "run.r not found" >> output.r
+            commit_output
+            exit 0
+          fi
+
+          LAST_CONTENT=$(cat .run.current 2>/dev/null || true)
+
+          if [[ "$(echo "$LAST_CONTENT" | tr -d ' \t\n\r')" == "clear" ]]; then
+
+            : > output.r
+            commit_output
+
+          else
+
+            echo "---" >> output.r
+            commit_output
+
+            run_script .run.current &
+            CURRENT_PID=$!
+
+          fi
+
+          while true; do
+
+            CURRENT_TIME=$(date +%s)
+            ELAPSED=$((CURRENT_TIME - START_TIME))
+
+            if [[ "$ELAPSED" -ge "$MAX_RUNTIME" ]]; then
+
+              if [[ -n "$CURRENT_PID" ]]; then
+                kill "$CURRENT_PID" 2>/dev/null || true
+                wait "$CURRENT_PID" 2>/dev/null || true
+              fi
+
+              commit_output
+              backup_to_release
+
+              break
+            fi
+
+            if [[ $((CURRENT_TIME - LAST_BACKUP_TIME)) -ge 30 ]]; then
+
+              backup_to_release
+
+              LAST_BACKUP_TIME=$CURRENT_TIME
+            fi
+
+            if [[ $((CURRENT_TIME % 5)) -eq 0 ]]; then
+
+              fetch_remote_run
+
+              if [[ -f ".run.remote" ]]; then
+
+                CURRENT_CONTENT=$(cat .run.remote 2>/dev/null || true)
+
+                if [[ "$CURRENT_CONTENT" != "$LAST_CONTENT" ]]; then
+
+                  if [[ -n "$CURRENT_PID" ]]; then
+                    kill "$CURRENT_PID" 2>/dev/null || true
+                    wait "$CURRENT_PID" 2>/dev/null || true
+                  fi
+
+                  sleep 1
+
+                  cp .run.remote .run.current
+
+                  LAST_CONTENT="$CURRENT_CONTENT"
+
+                  if [[ "$(echo "$CURRENT_CONTENT" | tr -d ' \t\n\r')" == "clear" ]]; then
+
+                    : > output.r
+                    commit_output
+
+                  else
+
+                    echo "---" >> output.r
+                    commit_output
+
+                    run_script .run.current &
+                    CURRENT_PID=$!
+
+                  fi
+                fi
+              fi
+            fi
+
+            sleep 2
+          done
+
+      - name: Final backup
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+
+          rm -f backup.tar.gz
+
+          tar -czf backup.tar.gz \
+            "$HOME/.local" \
+            "$HOME/.cache" \
+            "$HOME/.cargo" \
+            "$HOME/.dotnet" \
+            persistent_storage \
+            >/dev/null 2>&1 || true
+
+          if [[ -f backup.tar.gz ]]; then
+
+            gh release delete persistent-data \
+              --yes \
+              >/dev/null 2>&1 || true
+
+            gh release create persistent-data \
+              --title "Persistent Data" \
+              --notes "Final backup at $(date)" \
+              >/dev/null 2>&1 || true
+
+            gh release upload persistent-data \
+              backup.tar.gz \
+              --clobber \
+              >/dev/null 2>&1 || true
+          fi
+
+          rm -f backup.tar.gz
+
+      - name: Wake up Workflow A
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+        run: |
+          curl -fsS -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$OWNER/$REPO/dispatches" \
+            -d '{"event_type":"wake-up-a"}' \
+            || true
