@@ -1,0 +1,102 @@
+name: Setup - Initial environment
+
+on:
+  workflow_dispatch:
+
+jobs:
+  setup:
+    runs-on: ubuntu-24.04-arm
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install basic environment
+        run: |
+          set -e
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            python3 \
+            python3-pip \
+            python3-venv \
+            git \
+            curl \
+            wget \
+            tar \
+            gzip
+
+          python3 -m venv "$HOME/.venv"
+
+          "$HOME/.venv/bin/python" -m pip install --upgrade pip
+
+          "$HOME/.venv/bin/pip" install \
+            requests \
+            numpy \
+            pandas
+
+          echo "$HOME/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Prepare persistent directories
+        run: |
+          mkdir -p \
+            "$HOME/.local" \
+            "$HOME/.cache" \
+            "$HOME/.cargo" \
+            "$HOME/.dotnet" \
+            persistent_storage
+
+          echo "Initial setup at $(date)" \
+            > persistent_storage/init.txt
+
+      - name: Create initial backup
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+
+          rm -f backup.tar.gz
+
+          tar -czf backup.tar.gz \
+            "$HOME/.local" \
+            "$HOME/.cache" \
+            "$HOME/.cargo" \
+            "$HOME/.dotnet" \
+            persistent_storage
+
+          if [[ ! -s backup.tar.gz ]]; then
+            echo "Backup creation failed"
+            exit 1
+          fi
+
+          gh release delete persistent-data \
+            --yes \
+            >/dev/null 2>&1 || true
+
+          gh release create persistent-data \
+            --title "Persistent Data" \
+            --notes "Initial persistent storage - $(date)" \
+            >/dev/null 2>&1
+
+          if [[ $? -ne 0 ]]; then
+            echo "Failed to create Release"
+            exit 1
+          fi
+
+          gh release upload persistent-data \
+            backup.tar.gz \
+            --clobber \
+            >/dev/null 2>&1
+
+          if [[ $? -ne 0 ]]; then
+            echo "Failed to upload backup"
+            exit 1
+          fi
+
+          rm -f backup.tar.gz
+
+          echo "Initial persistent storage created successfully."
