@@ -1,2 +1,2 @@
-clear
 echo parham
+echo a
